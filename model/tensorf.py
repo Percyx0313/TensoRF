@@ -20,6 +20,32 @@ from util import debug, log
 
 from . import base
 
+class TVLoss(torch.nn.Module):
+    def __init__(self,TVLoss_weight=1):
+        super(TVLoss,self).__init__()
+        self.TVLoss_weight = TVLoss_weight
+
+    def forward(self,x):
+
+        batch_size = x.size()[0]
+        h_x = x.size()[2]
+        w_x = x.size()[3]
+        count_h = self._tensor_size(x[:,:,1:,:])
+        count_w = self._tensor_size(x[:,:,:,1:])
+        total = 0
+        if count_h > 0:
+            h_tv = torch.pow((x[:,:,1:,:]-x[:,:,:h_x-1,:]),2).sum()
+            h_tv /= count_h
+            total += h_tv
+        if count_w > 0:
+            w_tv = torch.pow((x[:,:,:,1:]-x[:,:,:,:w_x-1]),2).sum()
+            w_tv /= count_w
+            total += w_tv
+        return self.TVLoss_weight*2*(total)/batch_size
+
+    def _tensor_size(self,t):
+        return t.size()[1]*t.size()[2]*t.size()[3]
+    
 class Model(base.Model):
     def __init__(self, opt):
         super().__init__(opt)
@@ -85,15 +111,16 @@ class Model(base.Model):
                 self.graph.nerf.upsample_grid(current_resolution)
                 # register the optimizer for new tensor
                 optimizer = getattr(torch.optim, opt.optim.algo)
+                old_lr=self.sched.get_lr()[0]
                 self.optim = optimizer(
-                    [dict(params=self.graph.nerf.parameters(), lr=opt.optim.lr)]
+                    [dict(params=self.graph.nerf.parameters(), lr=old_lr)]
                 )
                 if opt.optim.sched:
                     scheduler = getattr(torch.optim.lr_scheduler, opt.optim.sched.type)
                     if opt.optim.lr_end:
                         assert opt.optim.sched.type == "ExponentialLR"
                         opt.optim.sched.gamma = (opt.optim.lr_end / opt.optim.lr) ** (
-                            1.0 / (opt.max_iter-self.it)
+                            1.0 / opt.max_iter
                         )
                     kwargs = {k: v for k, v in opt.optim.sched.items() if k != "type"}
                     self.sched = scheduler(self.optim, **kwargs)
@@ -312,6 +339,7 @@ class Graph(base.Graph):
     def __init__(self, opt):
         super().__init__(opt)
         self.nerf = NeRF(opt)
+        self.tvloss = TVLoss()
         if opt.nerf.fine_sampling:
             self.nerf_fine = NeRF(opt)
             
@@ -345,9 +373,15 @@ class Graph(base.Graph):
         # compute image losses
         if opt.loss_weight.render is not None:
             loss.render = self.MSE_loss(var.rgb, image)
-        if opt.loss_weight.render_fine is not None:
-            assert opt.nerf.fine_sampling
-            loss.render_fine = self.MSE_loss(var.rgb_fine, image)
+        if opt.loss_weight.density_L1 is not None:
+            loss.density_L1 = self.nerf.density_L1() 
+        if opt.loss_weight.TV_density is not None:
+            loss.TV_density = self.nerf.TV_loss_density(self.tvloss)
+        if opt.loss_weight.TV_color is not None:
+            loss.TV_color = self.nerf.TV_loss_color(self.tvloss)
+        if opt.loss_weight.Ortho_weight is not None:
+            loss.Ortho_weight = self.nerf.vector_comp_diffs()
+        
         return loss
     def get_pose(self, opt, var, mode=None):
         return var.pose
@@ -636,3 +670,33 @@ class NeRF(torch.nn.Module):
         self.color_plane, self.color_line = self.up_sampling_VM(self.color_plane, self.color_line, resolution)
         self.density_plane, self.density_line = self.up_sampling_VM(self.density_plane, self.density_line, resolution)
         print(f'upsamping to {resolution}')
+    def density_L1(self):
+        total = 0
+        for idx in range(len(self.density_plane)):
+            total = total + torch.mean(torch.abs(self.density_plane[idx])) + torch.mean(torch.abs(self.density_line[idx]))# + torch.mean(torch.abs(self.app_plane[idx])) + torch.mean(torch.abs(self.density_plane[idx]))
+        return total
+    def TV_loss_density(self, reg):
+        total = 0
+        for idx in range(len(self.density_plane)):
+            total = total + reg(self.density_plane[idx]) * 1e-2 #+ reg(self.density_line[idx]) * 1e-3
+        return total
+
+    def TV_loss_color(self, reg):
+        total = 0
+        for idx in range(len(self.color_plane)):
+            total = total + reg(self.color_plane[idx]) * 1e-2 #+ reg(self.app_line[idx]) * 1e-3
+        return total
+    
+    def vectorDiffs(self, vector_comps):
+        total = 0
+        
+        for idx in range(len(vector_comps)):
+            n_comp, n_size = vector_comps[idx].shape[1:-1]
+            
+            dotp = torch.matmul(vector_comps[idx].view(n_comp,n_size), vector_comps[idx].view(n_comp,n_size).transpose(-1,-2))
+            non_diagonal = dotp.view(-1)[1:].view(n_comp-1, n_comp+1)[...,:-1]
+            total = total + torch.mean(torch.abs(non_diagonal))
+        return total
+
+    def vector_comp_diffs(self):
+        return self.vectorDiffs(self.density_line) + self.vectorDiffs(self.color_line)
