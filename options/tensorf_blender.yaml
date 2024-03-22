@@ -6,8 +6,8 @@ arch:                                                       # architectural opti
     color_feat_dim : 27
     density_n_comp: [16,16,16]                              # number of components for desity prediction [x , y , z]
     N_voxel_init : 2097156 # 128**3                         # initial number of voxels
-    N_voxel_final : 262144000 # 640**3                      # final number of voxels
-    upsample_list : [2000,3000,4000,5500]                   # upsample the voxel grid at these iterations
+    N_voxel_final : 27000000 # 300**3                      # final number of voxels
+    upsample_list : [2000,3000,4000,5500,7000]                  # upsample the voxel grid at these iterations
 
 
 
@@ -25,12 +25,12 @@ nerf:                                                       # NeRF-specific opti
     setbg_opaque: false                                     # fill transparent rendering with known background color (Blender only)
     occ_grid_reso: 128
     # = (6 - 2) / 128
-    occ_step_size: 0.03
+    occ_step_size: 0.005
 
 data:                                                       # data options
     dataset: blender                                        # dataset name
     scene: lego                                             # scene name
-    image_size: [400,400]                                   # input image sizes [height,width]
+    image_size: [800,800]                                   # input image sizes [height,width]
     num_workers: 4                                          # number of parallel workers for data loading
     preload: true                                           # preload the entire dataset into the memory
     bgcolor: 1                                              # background color (Blender only)
@@ -44,12 +44,12 @@ loss_weight:                                                # loss weights (in l
     render: 0                                               # RGB rendering loss
     render_fine:                                            # RGB rendering loss (for fine NeRF)
     density_L1 : -5
-    TV_density: 1.0
-    TV_color: 1.0
+    TV_density: 0
+    TV_color: 0
     Ortho_weight : 0
 
 optim:                                                      # optimization options
-    lr: 1.e-2                                               # learning rate (main)
+    lr: 1.e-3                                               # learning rate (main)
     lr_end: 1.e-4                                           # terminal learning rate (only used with sched.type=ExponentialLR)
     sched:                                                  # learning rate scheduling options
         type: ExponentialLR                                 # scheduler (see PyTorch doc)
@@ -57,7 +57,7 @@ optim:                                                      # optimization optio
 
 batch_size:                                                 # batch size (not used for NeRF/BARF)
 max_epoch:                                                  # train to maximum number of epochs (not used for NeRF/BARF)
-max_iter: 20000                                            # train to maximum number of iterations
+max_iter: 15000                                            # train to maximum number of iterations
 
 trimesh:                                                    # options for marching cubes to extract 3D mesh
     res: 128                                                # 3D sampling resolution

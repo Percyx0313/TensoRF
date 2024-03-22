@@ -62,13 +62,11 @@ class Model(base.Model):
     def setup_optimizer(self, opt):
         log.info("setting up optimizers...")
         optimizer = getattr(torch.optim, opt.optim.algo)
-        self.optim = optimizer(
-            [dict(params=self.graph.nerf.parameters(), lr=opt.optim.lr)]
-        )
-        if opt.nerf.fine_sampling:
-            self.optim.add_param_group(
-                dict(params=self.graph.nerf_fine.parameters(), lr=opt.optim.lr)
-            )
+        grad_vars = self.graph.nerf.get_optparam_groups(0.02, 0.001)
+        self.optim = optimizer( grad_vars, betas=(0.9, 0.99))
+        # self.optim = optimizer(
+        #     [dict(params=self.graph.nerf.parameters(), lr=opt.optim.lr)]
+        # )
         # set up scheduler
         if opt.optim.sched:
             scheduler = getattr(torch.optim.lr_scheduler, opt.optim.sched.type)
@@ -111,10 +109,10 @@ class Model(base.Model):
                 self.graph.nerf.upsample_grid(current_resolution)
                 # register the optimizer for new tensor
                 optimizer = getattr(torch.optim, opt.optim.algo)
-                old_lr=self.sched.get_lr()[0]
-                self.optim = optimizer(
-                    [dict(params=self.graph.nerf.parameters(), lr=old_lr)]
-                )
+                scale=opt.optim.sched.gamma**self.it
+                
+                grad_vars = self.graph.nerf.get_optparam_groups(0.02*scale, 0.001*scale)
+                self.optim = optimizer(grad_vars, betas=(0.9, 0.99) )
                 if opt.optim.sched:
                     scheduler = getattr(torch.optim.lr_scheduler, opt.optim.sched.type)
                     if opt.optim.lr_end:
@@ -373,14 +371,14 @@ class Graph(base.Graph):
         # compute image losses
         if opt.loss_weight.render is not None:
             loss.render = self.MSE_loss(var.rgb, image)
-        if opt.loss_weight.density_L1 is not None:
-            loss.density_L1 = self.nerf.density_L1() 
-        if opt.loss_weight.TV_density is not None:
-            loss.TV_density = self.nerf.TV_loss_density(self.tvloss)
-        if opt.loss_weight.TV_color is not None:
-            loss.TV_color = self.nerf.TV_loss_color(self.tvloss)
-        if opt.loss_weight.Ortho_weight is not None:
-            loss.Ortho_weight = self.nerf.vector_comp_diffs()
+        # if opt.loss_weight.density_L1 is not None:
+        #     loss.density_L1 = self.nerf.density_L1() 
+        # if opt.loss_weight.TV_density is not None:
+        #     loss.TV_density = self.nerf.TV_loss_density(self.tvloss)
+        # if opt.loss_weight.TV_color is not None:
+        #     loss.TV_color = self.nerf.TV_loss_color(self.tvloss)
+        # if opt.loss_weight.Ortho_weight is not None:
+        #     loss.Ortho_weight = self.nerf.vector_comp_diffs()
         
         return loss
     def get_pose(self, opt, var, mode=None):
@@ -417,10 +415,9 @@ class Graph(base.Graph):
                 positions = (
                     t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
                 )
-                return self.nerf(
+                return self.nerf.feature2density(self.nerf(
                     opt, positions, t_dirs, mode=mode, density_only=True
-                )
-
+                )*25)
             def rgb_sigma_fn(t_starts, t_ends, ray_indices):
                 if ray_indices.shape[0] == 0:
                     return torch.zeros(
@@ -432,7 +429,7 @@ class Graph(base.Graph):
                     t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
                 )
                 rgb, sigma = self.nerf(opt, positions, t_dirs, mode=mode)
-                return rgb, sigma
+                return rgb, self.nerf.feature2density(sigma*25)
 
             ray_indices, t_starts, t_ends = self.nerf.occ_grid.sampling(
                 flatten_center,
@@ -522,8 +519,8 @@ class NeRF(torch.nn.Module):
             "occ_aabb", [-1.5, -1.5, -1.5, 1.5, 1.5, 1.5]
         ))
         self.occ_step_size = opt.nerf.get("occ_step_size", 5e-3)
-        self.occ_alpha_thres = opt.nerf.get("occ_alpha_thres", 0.0)
-        self.occ_thres = opt.nerf.get("occ_thres", 0.01)
+        self.occ_alpha_thres = opt.nerf.get("occ_alpha_thres", 1e-2)
+        self.occ_thres = opt.nerf.get("occ_thres", 0.001)
         self.occ_ema_decay = opt.nerf.get("occ_ema_decay", 0.95)
         if self.use_occ_grid > 0:
             self.occ_grid = nerfacc.OccGridEstimator(
@@ -531,26 +528,28 @@ class NeRF(torch.nn.Module):
             )
 
             def occ_eval_fn(opt, x, mode):
-                density = self(opt, x, mode=mode, density_only=True)
+                density = self.feature2density(self(opt, x, mode=mode, density_only=True))*25
                 return density * self.occ_step_size
 
             self.occ_eval_fn = occ_eval_fn
 
         # tensoRF
         self.init_scale=0.1
-        self.color_feat_dim=opt.nerf.get("color_feat_dim", 27)
-        self.color_n_comp=opt.nerf.get("color_n_comp", [16,16,16])
-        self.density_n_comp=opt.nerf.get("density_n_comp", [16,16,16])
-        self.N_voxel_init=opt.nerf.get("N_voxel_init", 128**3)
-        self.N_voxel_final=opt.nerf.get("N_voxel_final", 640**3)
-        self.upsample_list=opt.nerf.get("upsample_list", [2000,3000,4000,5500])
+        self.color_feat_dim=opt.arch.get("color_feat_dim", 27)
+        self.color_n_comp=opt.arch.get("color_n_comp", [48,48,48])
+        self.density_n_comp=opt.arch.get("density_n_comp", [16,16,16])
+        self.N_voxel_init=opt.arch.get("N_voxel_init", 128**3)
+        self.N_voxel_final=opt.arch.get("N_voxel_final", 640**3)
+        self.upsample_list=opt.arch.get("upsample_list", [2000,3000,4000,5500])
         self.upsample_n_voxel_list = (torch.round(torch.exp(torch.linspace(
             np.log(self.N_voxel_init),np.log(self.N_voxel_final),len(self.upsample_list) + 1))).long()).tolist()[1:]
         self.grid_size=self.N_to_resolution(self.N_voxel_init, self.occ_aabb)
         self.matMode = [[0,1], [0,2], [1,2]]
         self.vecMode =  [2, 1, 0]
+        self.density_shift=-10
         
         self.define_network(opt)
+        print(self.color_network)
     def N_to_resolution(self,n_voxels, aabb):
         '''
         input : 
@@ -580,7 +579,7 @@ class NeRF(torch.nn.Module):
         self.color_plane, self.color_line = self.init_VM_decomposition(self.color_n_comp, self.grid_size, 0.1) # list[3] [1,n_comp,grid_size,grid_size]  [1,n_comp,grid_size,1]
         self.basis_mat = torch.nn.Linear(sum(self.color_n_comp), self.color_feat_dim, bias=False) # [3*color_n_comp, app_dim]
         # color network
-        in_mlpC = (3+2*6*3)  + self.color_feat_dim #
+        in_mlpC = (3+2*2*3) +(2*2*self.color_feat_dim) + self.color_feat_dim #
         self.color_network = torch.nn.Sequential(
             torch.nn.Linear(in_mlpC, 128),
             torch.nn.ReLU(inplace=True),
@@ -588,9 +587,8 @@ class NeRF(torch.nn.Module):
             torch.nn.ReLU(inplace=True),
             torch.nn.Linear(128, 3)
         )
+        torch.nn.init.constant_(self.color_network[-1].bias, 0)
         
-    def tensorflow_init_weights(self, opt, linear, out=None):
-        raise NotImplementedError
 
     def query_density_feature(self, xyz):
         # plane + line basis
@@ -628,6 +626,7 @@ class NeRF(torch.nn.Module):
     def forward(
         self, opt, points_3D, ray_unit=None, mode=None, density_only=False
     ):  # [B,...,3]
+        points_3D= (points_3D-self.occ_aabb[0])*(2/(self.occ_aabb[3]-self.occ_aabb[0]))-1
         density=self.query_density_feature(points_3D)
         if density_only==True:
             return density
@@ -635,12 +634,21 @@ class NeRF(torch.nn.Module):
         color_feat=self.query_color_feature(points_3D)
         if opt.nerf.view_dep:
             assert ray_unit is not None
+            # ray_unit=(ray_unit+1)/2
             ray_enc = self.positional_encoding(
-                opt, ray_unit, L=6
+                opt, ray_unit, L=2
             )
             ray_enc = torch.cat([ray_unit, ray_enc], dim=-1)  # [B,...,6L+3]
-            feat = torch.cat([color_feat, ray_enc], dim=-1)
-        feat=self.color_network(feat)
+            # pose_enc=self.positional_encoding(opt,points_3D,6)
+            # pose_enc = torch.cat([points_3D, pose_enc], dim=-1)  # [B,...,6L+3]
+            color_feat_enc= self.positional_encoding(
+                opt, color_feat, L=2
+            )
+            # color_feat_enc = torch.cat([color_feat, color_feat_enc], dim=-1)  # [B,...,6L+3]
+            
+            
+            feat_enc=torch.cat([color_feat,color_feat_enc, ray_enc], dim=-1)
+        feat=self.color_network(feat_enc)
         rgb = feat.sigmoid_()  # [B,...,3]
         return rgb, density
     def positional_encoding(self, opt, input, L):  # [B,...,N]
@@ -700,3 +708,12 @@ class NeRF(torch.nn.Module):
 
     def vector_comp_diffs(self):
         return self.vectorDiffs(self.density_line) + self.vectorDiffs(self.color_line)
+    def feature2density(self, density_features):
+        return torch_F.softplus(density_features+self.density_shift)
+    def get_optparam_groups(self, lr_init_spatialxyz = 0.02, lr_init_network = 0.001):
+        grad_vars = [{'params': self.density_line, 'lr': lr_init_spatialxyz}, {'params': self.density_plane, 'lr': lr_init_spatialxyz},
+                     {'params': self.color_line, 'lr': lr_init_spatialxyz}, {'params': self.color_plane, 'lr': lr_init_spatialxyz},
+                         {'params': self.basis_mat.parameters(), 'lr':lr_init_network}]
+        if isinstance(self.color_network, torch.nn.Module):
+            grad_vars += [{'params':self.color_network.parameters(), 'lr':lr_init_network}]
+        return grad_vars
